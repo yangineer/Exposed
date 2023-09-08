@@ -1,16 +1,22 @@
 package org.jetbrains.exposed.sql.tests.shared.entities
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import org.jetbrains.exposed.dao.IntEntity
 import org.jetbrains.exposed.dao.IntEntityClass
 import org.jetbrains.exposed.dao.entityCache
 import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.dao.id.IntIdTable
 import org.jetbrains.exposed.sql.SchemaUtils
+import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.tests.DatabaseTestsBase
 import org.jetbrains.exposed.sql.tests.TestDB
 import org.jetbrains.exposed.sql.tests.shared.assertEqualCollections
 import org.jetbrains.exposed.sql.tests.shared.assertEquals
+import org.jetbrains.exposed.sql.transactions.experimental.suspendedTransactionAsync
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.junit.Assume
 import org.junit.Test
@@ -160,7 +166,7 @@ class EntityCacheTests : DatabaseTestsBase() {
     }
 
     @Test
-    fun `EntityCache should not be cleaned on explicit commit` () {
+    fun `EntityCache should not be cleaned on explicit commit`() {
         withTables(TestTable) {
             val entity = TestEntity.new {
                 value = Random.nextInt()
@@ -168,6 +174,43 @@ class EntityCacheTests : DatabaseTestsBase() {
             assertEquals(entity, TestEntity.testCache(entity.id))
             commit()
             assertEquals(entity, TestEntity.testCache(entity.id))
+        }
+    }
+
+    @Test
+    fun `wrapRow in select For Update should not return stale value`() {
+        withTables(TestTable) {
+            val entityId = TestEntity.new {
+                value = 0
+            }.id
+            commit()
+
+            val job = GlobalScope.async {
+                // 5 concurrent threads to increment entity's value
+                (1..5).map {
+                    suspendedTransactionAsync(Dispatchers.IO, db = db) {
+                        val currentEntity = TestEntity.findById(entityId)!!
+                        // Simple business logic:
+                        // Increment value if it's not over 100 yet
+                        if (currentEntity.value < 100) {
+                            // Select for update to lock the row
+                            val lockedEntity = TestTable.select { TestTable.id eq currentEntity.id }.forUpdate().map { row ->
+                                TestEntity.wrapRow(row).also { entity ->
+                                    // Fetched row should have same value as entity!
+                                    assertEquals(entity.value, row[TestTable.value])
+                                }
+                            }.first()
+                            lockedEntity.value += 1 // Increments value
+                        }
+                        // Update will be flushed when transaction finishes
+                    }
+                }.awaitAll()
+            }
+            while (!job.isCompleted) Thread.sleep(100)
+            job.getCompletionExceptionOrNull()?.let { throw it }
+            val updatedEntity = TestTable.select { TestTable.id eq entityId }.map { TestEntity.wrapRow(it) }.first()
+            // Summing 5 times should give 5 in total
+            assertEquals(5, updatedEntity.value)
         }
     }
 }
